@@ -50,10 +50,122 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from typing import Any
+import threading
+import time
+from typing import Any, TextIO
 
 from axiom.contract import MathResult, error_result
 from axiom.core import Axiom
+
+
+# ---------------------------------------------------------------------------
+# Resource-consumption guards (CWE-400 / CWE-770 — ADR-0033)
+#
+# The stdio JSON-RPC loop is the agent-facing surface of AXIOM. Without
+# bounds, a client (or a runaway agent) can exhaust host memory and CPU by
+# flooding requests or sending oversized messages, and tool parameters such
+# as evaluation precision can request unbounded computational work. Every
+# cap below is environment-overridable and fails closed to the documented
+# default when the override is missing or invalid.
+# ---------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int, *, allow_zero: bool = False) -> int:
+    """Read a positive integer override from the environment (fail-closed to default)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value == 0 and allow_zero:
+        return 0
+    return value if value > 0 else default
+
+
+MAX_MESSAGE_BYTES: int = _env_int("AXIOM_MCP_MAX_MESSAGE_BYTES", 1_048_576)
+MAX_EVAL_PRECISION: int = _env_int("AXIOM_MCP_MAX_PRECISION", 10_000)
+MAX_PLOT_POINTS: int = _env_int("AXIOM_MCP_MAX_POINTS", 10_000)
+MAX_EXPLORE_SAMPLES: int = _env_int("AXIOM_MCP_MAX_SAMPLES", 1_000)
+MAX_SEARCH_RESULTS: int = _env_int("AXIOM_MCP_MAX_RESULTS", 50)
+MAX_DIFF_ORDER: int = _env_int("AXIOM_MCP_MAX_ORDER", 20)
+RATE_LIMIT_PER_SECOND: int = _env_int("AXIOM_MCP_RATE_LIMIT", 20, allow_zero=True)
+RATE_LIMIT_BURST: int = _env_int("AXIOM_MCP_RATE_LIMIT_BURST", 40)
+
+
+class TokenBucketRateLimiter:
+    """Thread-safe token-bucket rate limiter (CWE-770 guard).
+
+    ``rate_per_second`` tokens refill continuously up to ``burst``; each
+    request consumes one token. ``rate_per_second=0`` explicitly disables
+    limiting (opt-out for benchmarks and local runs).
+    """
+
+    def __init__(self, rate_per_second: int, burst: int) -> None:
+        self.rate = float(rate_per_second)
+        self.burst = float(max(burst, 1))
+        self._tokens = self.burst
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def allow(self) -> bool:
+        """Consume one token; return False (deny) when the bucket is empty."""
+        if self.rate <= 0:
+            return True
+        with self._lock:
+            now = time.monotonic()
+            self._tokens = min(self.burst, self._tokens + (now - self._last) * self.rate)
+            self._last = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return True
+            return False
+
+
+def _read_bounded_line(stream: TextIO, max_chars: int) -> tuple[str | None, bool]:
+    """Read one line of at most ``max_chars`` characters from ``stream``.
+
+    Returns ``(line, oversized)``: ``line`` is ``None`` only at EOF. When
+    ``oversized`` is True the line exceeded ``max_chars`` and its remainder
+    has been drained — the truncated ``line`` must not be processed.
+    """
+    chunk = stream.readline(max_chars + 1)
+    if not chunk:
+        return None, False
+    if chunk.endswith("\n"):
+        return chunk, False
+    peek = stream.readline(1)
+    if not peek:
+        # EOF without a trailing newline: chunk is the complete final line.
+        return chunk, False
+    # The line continues past the cap: drain and discard the remainder.
+    tail = peek
+    while tail and not tail.endswith("\n"):
+        tail = stream.readline(1 << 20)
+    return chunk, True
+
+
+def _capped_int_arg(
+    args: dict[str, Any], key: str, default: int, maximum: int
+) -> tuple[int | None, str]:
+    """Parse ``args[key]`` as an integer enforced against a resource cap.
+
+    Returns ``(value, "")`` on success or ``(None, message)`` when the value
+    is not an integer or exceeds ``maximum`` (fail-closed, CWE-400 guard).
+    """
+    raw = args.get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None, f"parameter {key!r} must be an integer, got {raw!r}"
+    if value > maximum:
+        return None, (
+            f"parameter {key!r} = {value} exceeds the safety cap of {maximum} "
+            "(uncontrolled resource consumption guard; tune the corresponding "
+            "AXIOM_MCP_* environment variable if you genuinely need more)"
+        )
+    return value, ""
 
 
 _ASSUMPTIONS_PROPERTY: dict[str, Any] = {
@@ -148,7 +260,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "expression": {"type": "string", "description": "Expression to differentiate."},
                 "variable": {"type": "string", "description": "Differentiation variable (default: x)."},
-                "order": {"type": "integer", "default": 1, "description": "Derivative order (>= 1)."},
+                "order": {"type": "integer", "default": 1, "description": "Derivative order (>= 1, capped for resource safety)."},
                 "assumptions": _ASSUMPTIONS_PROPERTY,
             },
             "required": ["expression"],
@@ -208,7 +320,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "expression": {"type": "string", "description": "Expression to evaluate."},
                 "precision": {
                     "type": "integer",
-                    "description": "Decimal digits of precision for numerical evaluation.",
+                    "description": "Decimal digits of precision for numerical evaluation (capped for resource safety).",
                 },
                 "substitutions": {
                     "type": "object",
@@ -232,7 +344,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "variable": {"type": "string", "description": "Independent variable (default: x)."},
                 "min": {"type": "number", "default": -10.0, "description": "Domain minimum."},
                 "max": {"type": "number", "default": 10.0, "description": "Domain maximum."},
-                "points": {"type": "integer", "default": 101, "description": "Number of sample points."},
+                "points": {"type": "integer", "default": 101, "description": "Number of sample points (capped for resource safety)."},
                 "output": {"type": "string", "description": "Optional file path to save PNG/SVG plot."},
             },
             "required": ["expression"],
@@ -361,7 +473,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "expression": {"type": "string", "description": "Expression to explore."},
                 "variable": {"type": "string", "description": "Variable to analyze (default: x)."},
-                "samples": {"type": "integer", "default": 7, "description": "Number of sample evaluations."},
+                "samples": {"type": "integer", "default": 7, "description": "Number of sample evaluations (capped for resource safety)."},
             },
             "required": ["expression"],
         },
@@ -756,7 +868,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "max_results": {
                     "type": "integer",
                     "default": 8,
-                    "description": "Maximum number of matching declarations to return.",
+                    "description": "Maximum number of matching declarations to return (capped for resource safety).",
                 },
                 "online": {
                     "type": "boolean",
@@ -795,7 +907,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "max_results": {
                     "type": "integer",
                     "default": 8,
-                    "description": "Maximum number of results to return.",
+                    "description": "Maximum number of results to return (capped for resource safety).",
                 },
                 "online": {
                     "type": "boolean",
@@ -904,10 +1016,13 @@ def dispatch_tool(
         )
 
     if name == "math_differentiate":
+        order, err = _capped_int_arg(args, "order", 1, MAX_DIFF_ORDER)
+        if err:
+            return error_result("math_differentiate", str(args.get("expression", "")), err)
         return ax.differentiate(
             args["expression"],
             variable=args.get("variable"),
-            order=int(args.get("order", 1)),
+            order=order,
             assumptions=args.get("assumptions"),
         )
 
@@ -931,9 +1046,14 @@ def dispatch_tool(
         )
 
     if name == "math_evaluate":
+        precision = args.get("precision")
+        if precision is not None:
+            precision, err = _capped_int_arg(args, "precision", 50, MAX_EVAL_PRECISION)
+            if err:
+                return error_result("math_evaluate", str(args.get("expression", "")), err)
         return ax.evaluate(
             args["expression"],
-            precision=args.get("precision"),
+            precision=precision,
             substitutions=args.get("substitutions"),
             assumptions=args.get("assumptions"),
         )
@@ -954,11 +1074,14 @@ def dispatch_tool(
             if not ok:
                 return error_result("math_plot", output_path, err)
             output_path = str(valid_path)
+        points, err = _capped_int_arg(args, "points", 101, MAX_PLOT_POINTS)
+        if err:
+            return error_result("math_plot", str(args.get("expression", "")), err)
         return ax.plot(
             args["expression"],
             variable=args.get("variable"),
             range_=(x_min, x_max),
-            points=int(args.get("points", 101)),
+            points=points,
             output=output_path,
         )
 
@@ -1029,10 +1152,13 @@ def dispatch_tool(
         )
 
     if name == "math_explore":
+        samples, err = _capped_int_arg(args, "samples", 7, MAX_EXPLORE_SAMPLES)
+        if err:
+            return error_result("math_explore", str(args.get("expression", "")), err)
         return ax.explore(
             args["expression"],
             variable=args.get("variable"),
-            samples=int(args.get("samples", 7)),
+            samples=samples,
         )
 
     if name == "math_matrix":
@@ -1156,16 +1282,21 @@ def dispatch_tool(
         )
 
     if name == "math_search_mathlib":
+        max_results, err = _capped_int_arg(args, "max_results", 8, MAX_SEARCH_RESULTS)
+        if err:
+            return error_result("math_search_mathlib", str(args.get("query", "")), err)
         return ax.search_mathlib(
             args["query"],
-            max_results=int(args.get("max_results", 8)),
+            max_results=max_results,
             online=bool(args.get("online", False)),
         )
 
     if name == "math_search_literature":
         mode = args.get("mode", "search")
         query = args["query"]
-        max_res = int(args.get("max_results", 8))
+        max_res, err = _capped_int_arg(args, "max_results", 8, MAX_SEARCH_RESULTS)
+        if err:
+            return error_result("math_search_literature", str(query), err)
         online = bool(args.get("online", True))
         if mode == "classification":
             return ax.lookup_msc(query, max_results=max_res, online=online)
@@ -1247,29 +1378,75 @@ def handle_jsonrpc_message(
     }
 
 
+def _write_jsonrpc_response(resp: dict[str, Any]) -> None:
+    """Write one JSON-RPC response line to stdout and flush immediately."""
+    sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
 def run_stdio_server() -> int:
-    """Run the AXIOM MCP server over standard input/output (JSON-RPC 2.0 lines)."""
+    """Run the AXIOM MCP server over standard input/output (JSON-RPC 2.0 lines).
+
+    Every request passes two resource-consumption guards (ADR-0033): a
+    per-connection token-bucket rate limiter and a maximum JSON-RPC message
+    size. Oversized or throttled requests receive a JSON-RPC error and the
+    loop keeps serving; both caps are environment-configurable.
+    """
     ax = Axiom()
-    for raw_line in sys.stdin:
+    limiter = TokenBucketRateLimiter(RATE_LIMIT_PER_SECOND, RATE_LIMIT_BURST)
+    while True:
+        raw_line, oversized = _read_bounded_line(sys.stdin, MAX_MESSAGE_BYTES)
+        if raw_line is None:
+            break
+        if oversized:
+            _write_jsonrpc_response(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32600,
+                        "message": (
+                            "Request too large: JSON-RPC message exceeds "
+                            f"{MAX_MESSAGE_BYTES} bytes (AXIOM_MCP_MAX_MESSAGE_BYTES)"
+                        ),
+                    },
+                }
+            )
+            continue
         line = raw_line.strip()
         if not line:
+            continue
+        if not limiter.allow():
+            _write_jsonrpc_response(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32000,
+                        "message": (
+                            "Rate limit exceeded: max "
+                            f"{RATE_LIMIT_PER_SECOND} requests/second "
+                            "(AXIOM_MCP_RATE_LIMIT); retry after a short delay"
+                        ),
+                    },
+                }
+            )
             continue
         try:
             msg = json.loads(line)
         except json.JSONDecodeError as exc:
-            err_resp = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": f"Parse error: {exc}"},
-            }
-            sys.stdout.write(json.dumps(err_resp) + "\n")
-            sys.stdout.flush()
+            _write_jsonrpc_response(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": f"Parse error: {exc}"},
+                }
+            )
             continue
 
         resp = handle_jsonrpc_message(msg, axiom=ax)
         if resp is not None:
-            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+            _write_jsonrpc_response(resp)
     return 0
 
 
